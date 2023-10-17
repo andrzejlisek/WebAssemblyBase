@@ -10,6 +10,7 @@
    <body>
       <a href="hello.cpp">C++ file</a><br>
       <a href="hello.wasm">WASM file</a><br>
+      <pre>emcc hello.cpp -Os -s WASM=1 -s SIDE_MODULE=1 -o hello.wasm</pre>
       <div id="textcontent"></div>
       <input type="button" value="Test" onclick="Test()">
       <input type="button" value="Start" onclick="ThrStart()">
