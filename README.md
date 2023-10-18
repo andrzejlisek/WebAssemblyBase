@@ -22,3 +22,9 @@ header("Cross-Origin-Embedder-Policy: require-corp");
 header("Cross-Origin-Opener-Policy: same-origin");
 ```
 
+# Project online link
+
+This project is under the link, but PHP pages does not work due to GitHub limitations.
+
+https://andrzejlisek.github.io/WebAssemblyBase/
+
