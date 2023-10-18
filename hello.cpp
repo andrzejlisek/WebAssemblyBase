@@ -1,56 +1,48 @@
-#include <iostream> 
-#include <cstdlib> 
+#include <cstdio>
 #include <emscripten.h>
 #include <string>
 
 //#define UseThr
 //#include <pthread.h>
 
-//#define UseWrk
-//#include <emscripten/wasm_worker.h>
+#define UseWrk
+#include <emscripten/wasm_worker.h>
 
 
-const char * StrTest()
+char * ReturnString;
+int ReturnStringSize = 256;
+
+
+EMSCRIPTEN_KEEPALIVE
+const char * StrTest1()
 {
-  return "Hello World";
+    return "Hello World";
 }
 
-
-
-
-EM_JS(void, callback1, (), {
-  alert('hai');
-  alert('bai');
-});
-
-EM_JS(int, callback2, (int x, float y), {
-  console.log('I received: ' + [x, y]);
-});
-
-EM_JS(int, callback3, (const char * s), {
-  console.log('I received: ' + [x, y]);
-});
-
-
-int CallbackTest(int n)
+EMSCRIPTEN_KEEPALIVE
+char * StrTest2(char * Str)
 {
-    switch (n)
+    int I = 0;
+    while ((Str[I] != 0) && (I < ReturnStringSize))
     {
-        case 1:
-            callback1();
-            return 555;
-        case 2:
-            return callback2(147, 85.25);
-        case 3:
-            return callback3("Hello from callback");
-        case 4:
-            emscripten_run_script("alert('hi')");
-            return 0;
-        default:
-            return 0;
+        ReturnString[I] = Str[I];
+        if ((Str[I] >= 'A') && (Str[I] <= 'Z')) { ReturnString[I] = (Str[I] + 32); }
+        if ((Str[I] >= 'a') && (Str[I] <= 'z')) { ReturnString[I] = (Str[I] - 32); }
+        I++;
     }
+    ReturnString[I] = 0;
+    return ReturnString;
 }
 
+
+
+EMSCRIPTEN_KEEPALIVE
+void myFunction(int argc, char ** argv)
+{
+    printf("MyFunction Called\n");
+}
+
+EMSCRIPTEN_KEEPALIVE
 int fib(int x)
 {
   if (x < 1)
@@ -59,6 +51,96 @@ int fib(int x)
     return 1;
   return fib(x-1)+fib(x-2);
 }
+
+
+
+
+
+
+EM_JS(int, Alert_, (const char * s), {
+  console.log('Komunikaty: ' + s);
+  return 1256;
+});
+
+
+void Alert(std::string s)
+{
+    s = "alert('" + s + "');";
+    emscripten_run_script(s.c_str());
+}
+
+void Info(std::string s)
+{
+    s = "Info('" + s + "');";
+    emscripten_run_script(s.c_str());
+}
+
+int CbTest11(int n)
+{
+    std::string s = "CallbackTestNum('" + std::to_string(n) + "');";
+    return emscripten_run_script_int(s.c_str());
+}
+
+EM_JS(int, CbTest12, (int x), {
+  return CallbackTestNum(x);
+});
+
+std::string CbTest21(std::string n)
+{
+    std::string s = "CallbackTestStr('" + n + "');";
+    std::string str = "";
+    str.append(emscripten_run_script_string(s.c_str()));
+    return str;
+}
+
+EM_JS(const char *, CbTest22_, (const char * x), {
+  let x_ = UTF8ToString(x);
+  let x__ = CallbackTestStr(x_);
+  return stringToUTF8OnStack(x__);
+});
+
+std::string CbTest22(std::string n)
+{
+    std::string str = "";
+    str.append(CbTest22_(n.c_str()));
+    return str;
+}
+
+
+EMSCRIPTEN_KEEPALIVE
+int CallbackTest(int n)
+{
+    switch (n)
+    {
+        case 0:
+            Info("Info from callback function");
+            return 0;
+        case 1:
+            return CbTest11(64);
+        case 2:
+            return CbTest12(64);
+        case 3:
+            Info("Returned from callback: " + CbTest21("Hello"));
+            return 777;
+        case 4:
+            Info("Returned from callback: " + CbTest22("Hello"));
+            return 777;
+        default:
+            return 0;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
 
 int ThrCounter;
 bool ThrWork;
@@ -72,12 +154,14 @@ bool ThrWork;
 
 void ThrProc()
 {
+    Info("Thread function start");
     ThrCounter = 0;
     ThrWork = true;
     while (ThrWork)
     {
         ThrCounter++;
     }
+    Info("Thread function stop");
 }
 
 void * ThrProc0(void *arg)
@@ -86,6 +170,7 @@ void * ThrProc0(void *arg)
     return 0;
 }
 
+EMSCRIPTEN_KEEPALIVE
 int ThrStart()
 {
     int result = 0;
@@ -99,18 +184,40 @@ int ThrStart()
     return result;
 }
 
+EMSCRIPTEN_KEEPALIVE
 int ThrStop()
 {
-    /*ThrWork = false;
+    ThrWork = false;
     #ifdef UseThr
         int result = pthread_join(Thr, NULL);
-    #endif*/
+    #endif
     return 0;
 }
 
+EMSCRIPTEN_KEEPALIVE
 int ThrStatus()
 {
-    //return ThrCounter;
+    return ThrCounter;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+int main()
+{
+    ReturnString = (char*)malloc(ReturnStringSize);
+
+    printf("Main function\n");
+    int N = fib(6);
+    printf("fib(6)=%d\n", N);
     return 0;
 }
 
