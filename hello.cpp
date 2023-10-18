@@ -2,12 +2,6 @@
 #include <emscripten.h>
 #include <string>
 
-//#define UseThr
-//#include <pthread.h>
-
-#define UseWrk
-#include <emscripten/wasm_worker.h>
-
 
 char * ReturnString;
 int ReturnStringSize = 256;
@@ -129,84 +123,6 @@ int CallbackTest(int n)
             return 0;
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-int ThrCounter;
-bool ThrWork;
-
-#ifdef UseThr
-    pthread_t Thr;
-#endif
-#ifdef UseWrk
-    emscripten_wasm_worker_t Wrk;
-#endif
-
-void ThrProc()
-{
-    Info("Thread function start");
-    ThrCounter = 0;
-    ThrWork = true;
-    while (ThrWork)
-    {
-        ThrCounter++;
-    }
-    Info("Thread function stop");
-}
-
-void * ThrProc0(void *arg)
-{
-    ThrProc();
-    return 0;
-}
-
-EMSCRIPTEN_KEEPALIVE
-int ThrStart()
-{
-    int result = 0;
-    #ifdef UseThr
-        result = pthread_create(&Thr, NULL, ThrProc0, (void *)NULL);
-    #endif
-    #ifdef UseWrk
-        Wrk = emscripten_malloc_wasm_worker(1024);
-        emscripten_wasm_worker_post_function_v(Wrk, ThrProc);
-    #endif
-    return result;
-}
-
-EMSCRIPTEN_KEEPALIVE
-int ThrStop()
-{
-    ThrWork = false;
-    #ifdef UseThr
-        int result = pthread_join(Thr, NULL);
-    #endif
-    return 0;
-}
-
-EMSCRIPTEN_KEEPALIVE
-int ThrStatus()
-{
-    return ThrCounter;
-}
-
-
-
-
-
-
-
-
 
 
 

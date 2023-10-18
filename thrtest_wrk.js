@@ -46,6 +46,19 @@ if (Module['ENVIRONMENT']) {
   throw new Error('Module.ENVIRONMENT has been deprecated. To force the environment, use the ENVIRONMENT compile-time option (for example, -sENVIRONMENT=web or -sENVIRONMENT=node)');
 }
 
+var ENVIRONMENT_IS_WASM_WORKER = Module['$ww'];
+
+// In MODULARIZE mode _scriptDir needs to be captured already at the very top of the page immediately when the page is parsed, so it is generated there
+// before the page load. In non-MODULARIZE modes generate it here.
+var _scriptDir = (typeof document != 'undefined' && document.currentScript) ? document.currentScript.src : undefined;
+
+if (ENVIRONMENT_IS_WORKER) {
+  _scriptDir = self.location.href;
+}
+else if (ENVIRONMENT_IS_NODE) {
+  _scriptDir = __filename;
+}
+
 // `/` should be present at the end if `scriptDirectory` is not empty
 var scriptDirectory = '';
 function locateFile(path) {
@@ -135,6 +148,15 @@ readAsync = (filename, onload, onerror, binary = true) => {
   };
 
   Module['inspect'] = () => '[Emscripten Module object]';
+
+  let nodeWorkerThreads;
+  try {
+    nodeWorkerThreads = require('worker_threads');
+  } catch (e) {
+    console.error('The "worker_threads" module is not supported in this node.js build - perhaps a newer version is needed?');
+    throw e;
+  }
+  global.Worker = nodeWorkerThreads.Worker;
 
 } else
 if (ENVIRONMENT_IS_SHELL) {
@@ -346,6 +368,9 @@ if (typeof WebAssembly != 'object') {
 
 var wasmMemory;
 
+// For sending to workers.
+var wasmModule;
+
 //========================================
 // Runtime essentials
 //========================================
@@ -368,6 +393,9 @@ function assert(condition, text) {
 
 // We used to include malloc/free by default in the past. Show a helpful error in
 // builds with assertions.
+function _malloc() {
+  abort("malloc() called but not included in the build - add '_malloc' to EXPORTED_FUNCTIONS");
+}
 function _free() {
   // Show a helpful error since we used to include free by default in the past.
   abort("free() called but not included in the build - add '_free' to EXPORTED_FUNCTIONS");
@@ -410,9 +438,41 @@ assert(!Module['STACK_SIZE'], 'STACK_SIZE can no longer be set at runtime.  Use 
 assert(typeof Int32Array != 'undefined' && typeof Float64Array !== 'undefined' && Int32Array.prototype.subarray != undefined && Int32Array.prototype.set != undefined,
        'JS engine does not provide full typed array support');
 
-// If memory is defined in wasm, the user can't provide it, or set INITIAL_MEMORY
-assert(!Module['wasmMemory'], 'Use of `wasmMemory` detected.  Use -sIMPORTED_MEMORY to define wasmMemory externally');
-assert(!Module['INITIAL_MEMORY'], 'Detected runtime INITIAL_MEMORY setting.  Use -sIMPORTED_MEMORY to define wasmMemory dynamically');
+// In non-standalone/normal mode, we create the memory here.
+// include: runtime_init_memory.js
+// Create the wasm memory. (Note: this only applies if IMPORTED_MEMORY is defined)
+
+var INITIAL_MEMORY = Module['INITIAL_MEMORY'] || 16777216;legacyModuleProp('INITIAL_MEMORY', 'INITIAL_MEMORY');
+
+assert(INITIAL_MEMORY >= 65536, 'INITIAL_MEMORY should be larger than STACK_SIZE, was ' + INITIAL_MEMORY + '! (STACK_SIZE=' + 65536 + ')');
+
+// check for full engine support (use string 'subarray' to avoid closure compiler confusion)
+
+  if (Module['wasmMemory']) {
+    wasmMemory = Module['wasmMemory'];
+  } else
+  {
+    wasmMemory = new WebAssembly.Memory({
+      'initial': INITIAL_MEMORY / 65536,
+      'maximum': INITIAL_MEMORY / 65536,
+      'shared': true,
+    });
+    if (!(wasmMemory.buffer instanceof SharedArrayBuffer)) {
+      err('requested a shared WebAssembly.Memory but the returned buffer is not a SharedArrayBuffer, indicating that while the browser has SharedArrayBuffer it does not have WebAssembly threads support - you may need to set a flag');
+      if (ENVIRONMENT_IS_NODE) {
+        err('(on node you may need: --experimental-wasm-threads --experimental-wasm-bulk-memory and/or recent version)');
+      }
+      throw Error('bad memory');
+    }
+  }
+
+updateMemoryViews();
+
+// If the user provides an incorrect length, just use that length instead rather than providing the user to
+// specifically provide the memory length with Module['INITIAL_MEMORY'].
+INITIAL_MEMORY = wasmMemory.buffer.byteLength;
+assert(INITIAL_MEMORY % 65536 === 0);
+// end include: runtime_init_memory.js
 
 // include: runtime_stack_check.js
 // Initializes the stack cookie. Called at the startup of main and at the startup of each thread in pthreads mode.
@@ -483,6 +543,8 @@ function preRun() {
 function initRuntime() {
   assert(!runtimeInitialized);
   runtimeInitialized = true;
+
+  if (ENVIRONMENT_IS_WASM_WORKER) return _wasmWorkerInitializeRuntime();
 
   checkStackCookie();
 
@@ -709,7 +771,7 @@ function createExportWrapper(name) {
 // include: runtime_exceptions.js
 // end include: runtime_exceptions.js
 var wasmBinaryFile;
-  wasmBinaryFile = 'hello.wasm';
+  wasmBinaryFile = 'thrtest_wrk.wasm';
   if (!isDataURI(wasmBinaryFile)) {
     wasmBinaryFile = locateFile(wasmBinaryFile);
   }
@@ -823,17 +885,14 @@ function createWasm() {
 
     
 
-    wasmMemory = wasmExports['memory'];
+    wasmTable = wasmExports['__indirect_function_table'];
     
-    assert(wasmMemory, "memory not found in wasm exports");
-    // This assertion doesn't hold when emscripten is run in --post-link
-    // mode.
-    // TODO(sbc): Read INITIAL_MEMORY out of the wasm file in post-link mode.
-    //assert(wasmMemory.buffer.byteLength === 16777216);
-    updateMemoryViews();
+    assert(wasmTable, "table not found in wasm exports");
 
     addOnInit(wasmExports['__wasm_call_ctors']);
 
+    // We now have the Wasm module loaded up, keep a reference to the compiled module so we can post it to the workers.
+    wasmModule = module;
     removeRunDependency('wasm-instantiate');
     return wasmExports;
   }
@@ -850,9 +909,7 @@ function createWasm() {
     // receiveInstance() will swap in the exports (to Module.asm) so they can be called
     assert(Module === trueModule, 'the Module object should not be replaced during async compilation - perhaps the order of HTML elements is wrong?');
     trueModule = null;
-    // TODO: Due to Closure regression https://github.com/google/closure-compiler/issues/3193, the above line no longer optimizes out down to the following line.
-    // When the regression is fixed, can restore the above PTHREADS-enabled path.
-    receiveInstance(result['instance']);
+    receiveInstance(result['instance'], result['module']);
   }
 
   // User shell pages can write their own Module.instantiateWasm = function(imports, successCallback) callback
@@ -980,11 +1037,6 @@ function dbg(text) {
 // end include: runtime_debug.js
 // === Body ===
 
-function Alert_(s) { console.log('Komunikaty: ' + s); return 1256; }
-function CbTest12(x) { return CallbackTestNum(x); }
-function CbTest22_(x) { let x_ = UTF8ToString(x); let x__ = CallbackTestStr(x_); return stringToUTF8OnStack(x__); }
-
-
 // end include: preamble.js
 
   /** @constructor */
@@ -993,6 +1045,51 @@ function CbTest22_(x) { let x_ = UTF8ToString(x); let x__ = CallbackTestStr(x_);
       this.message = `Program terminated with exit(${status})`;
       this.status = status;
     }
+
+  var _wasmWorkerDelayedMessageQueue = [];
+  
+  var wasmTableMirror = [];
+  
+  var wasmTable;
+  var getWasmTableEntry = (funcPtr) => {
+      var func = wasmTableMirror[funcPtr];
+      if (!func) {
+        if (funcPtr >= wasmTableMirror.length) wasmTableMirror.length = funcPtr + 1;
+        wasmTableMirror[funcPtr] = func = wasmTable.get(funcPtr);
+      }
+      assert(wasmTable.get(funcPtr) == func, "JavaScript-side Wasm function table mirror is out of date!");
+      return func;
+    };
+  var _wasmWorkerRunPostMessage = (e) => {
+      // '_wsc' is short for 'wasm call', trying to use an identifier name that
+      // will never conflict with user code
+      let data = e.data, wasmCall = data['_wsc'];
+      wasmCall && getWasmTableEntry(wasmCall)(...data['x']);
+    };
+  
+  var _wasmWorkerAppendToQueue = (e) => {
+      _wasmWorkerDelayedMessageQueue.push(e);
+    };
+  
+  var _wasmWorkerInitializeRuntime = () => {
+      let m = Module;
+      assert(m['sb'] % 16 == 0);
+      assert(m['sz'] % 16 == 0);
+  
+      // Run the C side Worker initialization for stack and TLS.
+      _emscripten_wasm_worker_initialize(m['sb'], m['sz']);
+  
+        // The Wasm Worker runtime is now up, so we can start processing
+        // any postMessage function calls that have been received. Drop the temp
+        // message handler that queued any pending incoming postMessage function calls ...
+        removeEventListener('message', _wasmWorkerAppendToQueue);
+        // ... then flush whatever messages we may have already gotten in the queue,
+        //     and clear _wasmWorkerDelayedMessageQueue to undefined ...
+        _wasmWorkerDelayedMessageQueue = _wasmWorkerDelayedMessageQueue.forEach(_wasmWorkerRunPostMessage);
+        // ... and finally register the proper postMessage handler that immediately
+        // dispatches incoming function calls without queueing them.
+        addEventListener('message', _wasmWorkerRunPostMessage);
+    };
 
   var callRuntimeCallbacks = (callbacks) => {
       while (callbacks.length > 0) {
@@ -1060,25 +1157,6 @@ function CbTest22_(x) { let x_ = UTF8ToString(x); let x__ = CallbackTestStr(x_);
       }
     };
 
-  var _abort = () => {
-      abort('native code called abort()');
-    };
-
-  var _emscripten_memcpy_js = (dest, src, num) => HEAPU8.copyWithin(dest, src, src + num);
-
-  var getHeapMax = () =>
-      HEAPU8.length;
-  
-  var abortOnCannotGrowMemory = (requestedSize) => {
-      abort(`Cannot enlarge memory arrays to size ${requestedSize} bytes (OOM). Either (1) compile with -sINITIAL_MEMORY=X with X higher than the current value ${HEAP8.length}, (2) compile with -sALLOW_MEMORY_GROWTH which allows increasing the size at runtime, or (3) if you want malloc to return NULL (0) instead of this abort, compile with -sABORTING_MALLOC=0`);
-    };
-  var _emscripten_resize_heap = (requestedSize) => {
-      var oldSize = HEAPU8.length;
-      // With CAN_ADDRESS_2GB or MEMORY64, pointers are already unsigned.
-      requestedSize >>>= 0;
-      abortOnCannotGrowMemory(requestedSize);
-    };
-
   var UTF8Decoder = typeof TextDecoder != 'undefined' ? new TextDecoder('utf8') : undefined;
   
     /**
@@ -1101,7 +1179,7 @@ function CbTest22_(x) { let x_ = UTF8ToString(x); let x__ = CallbackTestStr(x_);
       while (heapOrArray[endPtr] && !(endPtr >= endIdx)) ++endPtr;
   
       if (endPtr - idx > 16 && heapOrArray.buffer && UTF8Decoder) {
-        return UTF8Decoder.decode(heapOrArray.subarray(idx, endPtr));
+        return UTF8Decoder.decode(heapOrArray.buffer instanceof SharedArrayBuffer ? heapOrArray.slice(idx, endPtr) : heapOrArray.subarray(idx, endPtr));
       }
       var str = '';
       // If building with TextDecoder, we have already computed the string length
@@ -1152,104 +1230,66 @@ function CbTest22_(x) { let x_ = UTF8ToString(x); let x__ = CallbackTestStr(x_);
       assert(typeof ptr == 'number');
       return ptr ? UTF8ArrayToString(HEAPU8, ptr, maxBytesToRead) : '';
     };
+  var ___assert_fail = (condition, filename, line, func) => {
+      abort(`Assertion failed: ${UTF8ToString(condition)}, at: ` + [filename ? UTF8ToString(filename) : 'unknown filename', line, func ? UTF8ToString(func) : 'unknown function']);
+    };
+
+  var _wasmWorkers = {
+  };
+  
+  var _wasmWorkersID = 1;
+  
+  
+  var __emscripten_create_wasm_worker = (stackLowestAddress, stackSize) => {
+      let worker = _wasmWorkers[_wasmWorkersID] = new Worker(
+        // default runtime loads the .ww.js file on demand.
+        locateFile('thrtest_wrk.ww.js')
+      );
+      // Craft the Module object for the Wasm Worker scope:
+      worker.postMessage({
+        // Signal with a non-zero value that this Worker will be a Wasm Worker,
+        // and not the main browser thread.
+        '$ww': _wasmWorkersID,
+        'wasm': wasmModule,
+        'js': Module['mainScriptUrlOrBlob'] || _scriptDir,
+        'wasmMemory': wasmMemory,
+        'sb': stackLowestAddress, // sb = stack bottom (lowest stack address, SP points at this when stack is full)
+        'sz': stackSize,          // sz = stack size
+      });
+      worker.onmessage = _wasmWorkerRunPostMessage;
+      return _wasmWorkersID++;
+    };
+
+  var _abort = () => {
+      abort('native code called abort()');
+    };
+
+  var _emscripten_get_now;
+      // Modern environment where performance.now() is supported:
+      // N.B. a shorter form "_emscripten_get_now = performance.now;" is
+      // unfortunately not allowed even in current browsers (e.g. FF Nightly 75).
+      _emscripten_get_now = () => performance.now();
+  ;
+
+  var getHeapMax = () =>
+      HEAPU8.length;
+  
+  var abortOnCannotGrowMemory = (requestedSize) => {
+      abort(`Cannot enlarge memory arrays to size ${requestedSize} bytes (OOM). Either (1) compile with -sINITIAL_MEMORY=X with X higher than the current value ${HEAP8.length}, (2) compile with -sALLOW_MEMORY_GROWTH which allows increasing the size at runtime, or (3) if you want malloc to return NULL (0) instead of this abort, compile with -sABORTING_MALLOC=0`);
+    };
+  var _emscripten_resize_heap = (requestedSize) => {
+      var oldSize = HEAPU8.length;
+      // With CAN_ADDRESS_2GB or MEMORY64, pointers are already unsigned.
+      requestedSize >>>= 0;
+      abortOnCannotGrowMemory(requestedSize);
+    };
+
   var _emscripten_run_script = (ptr) => {
       eval(UTF8ToString(ptr));
     };
 
-  /** @suppress{checkTypes} */
-  var _emscripten_run_script_int = (ptr) => {
-      return eval(UTF8ToString(ptr))|0;
-    };
-
-  var lengthBytesUTF8 = (str) => {
-      var len = 0;
-      for (var i = 0; i < str.length; ++i) {
-        // Gotcha: charCodeAt returns a 16-bit word that is a UTF-16 encoded code
-        // unit, not a Unicode code point of the character! So decode
-        // UTF16->UTF32->UTF8.
-        // See http://unicode.org/faq/utf_bom.html#utf16-3
-        var c = str.charCodeAt(i); // possibly a lead surrogate
-        if (c <= 0x7F) {
-          len++;
-        } else if (c <= 0x7FF) {
-          len += 2;
-        } else if (c >= 0xD800 && c <= 0xDFFF) {
-          len += 4; ++i;
-        } else {
-          len += 3;
-        }
-      }
-      return len;
-    };
-  
-  var stringToUTF8Array = (str, heap, outIdx, maxBytesToWrite) => {
-      assert(typeof str === 'string');
-      // Parameter maxBytesToWrite is not optional. Negative values, 0, null,
-      // undefined and false each don't write out any bytes.
-      if (!(maxBytesToWrite > 0))
-        return 0;
-  
-      var startIdx = outIdx;
-      var endIdx = outIdx + maxBytesToWrite - 1; // -1 for string null terminator.
-      for (var i = 0; i < str.length; ++i) {
-        // Gotcha: charCodeAt returns a 16-bit word that is a UTF-16 encoded code
-        // unit, not a Unicode code point of the character! So decode
-        // UTF16->UTF32->UTF8.
-        // See http://unicode.org/faq/utf_bom.html#utf16-3
-        // For UTF8 byte structure, see http://en.wikipedia.org/wiki/UTF-8#Description
-        // and https://www.ietf.org/rfc/rfc2279.txt
-        // and https://tools.ietf.org/html/rfc3629
-        var u = str.charCodeAt(i); // possibly a lead surrogate
-        if (u >= 0xD800 && u <= 0xDFFF) {
-          var u1 = str.charCodeAt(++i);
-          u = 0x10000 + ((u & 0x3FF) << 10) | (u1 & 0x3FF);
-        }
-        if (u <= 0x7F) {
-          if (outIdx >= endIdx) break;
-          heap[outIdx++] = u;
-        } else if (u <= 0x7FF) {
-          if (outIdx + 1 >= endIdx) break;
-          heap[outIdx++] = 0xC0 | (u >> 6);
-          heap[outIdx++] = 0x80 | (u & 63);
-        } else if (u <= 0xFFFF) {
-          if (outIdx + 2 >= endIdx) break;
-          heap[outIdx++] = 0xE0 | (u >> 12);
-          heap[outIdx++] = 0x80 | ((u >> 6) & 63);
-          heap[outIdx++] = 0x80 | (u & 63);
-        } else {
-          if (outIdx + 3 >= endIdx) break;
-          if (u > 0x10FFFF) warnOnce('Invalid Unicode code point ' + ptrToString(u) + ' encountered when serializing a JS string to a UTF-8 string in wasm memory! (Valid unicode code points should be in range 0-0x10FFFF).');
-          heap[outIdx++] = 0xF0 | (u >> 18);
-          heap[outIdx++] = 0x80 | ((u >> 12) & 63);
-          heap[outIdx++] = 0x80 | ((u >> 6) & 63);
-          heap[outIdx++] = 0x80 | (u & 63);
-        }
-      }
-      // Null-terminate the pointer to the buffer.
-      heap[outIdx] = 0;
-      return outIdx - startIdx;
-    };
-  var stringToUTF8 = (str, outPtr, maxBytesToWrite) => {
-      assert(typeof maxBytesToWrite == 'number', 'stringToUTF8(str, outPtr, maxBytesToWrite) is missing the third parameter that specifies the length of the output buffer!');
-      return stringToUTF8Array(str, HEAPU8, outPtr, maxBytesToWrite);
-    };
-  
-  
-  var _emscripten_run_script_string = (ptr) => {
-      var s = eval(UTF8ToString(ptr));
-      if (s == null) {
-        return 0;
-      }
-      s += '';
-      var me = _emscripten_run_script_string;
-      var len = lengthBytesUTF8(s);
-      if (!me.bufferSize || me.bufferSize < len+1) {
-        if (me.bufferSize) _free(me.buffer);
-        me.bufferSize = len+1;
-        me.buffer = _malloc(me.bufferSize);
-      }
-      stringToUTF8(s, me.buffer, me.bufferSize);
-      return me.buffer;
+  var _emscripten_wasm_worker_post_function_v = (id, funcPtr) => {
+      _wasmWorkers[id].postMessage({'_wsc': funcPtr, 'x': [] }); // "WaSm Call"
     };
 
   var SYSCALLS = {
@@ -1379,7 +1419,78 @@ function CbTest22_(x) { let x_ = UTF8ToString(x); let x__ = CallbackTestStr(x_);
       HEAP8.set(array, buffer);
     };
   
+  var lengthBytesUTF8 = (str) => {
+      var len = 0;
+      for (var i = 0; i < str.length; ++i) {
+        // Gotcha: charCodeAt returns a 16-bit word that is a UTF-16 encoded code
+        // unit, not a Unicode code point of the character! So decode
+        // UTF16->UTF32->UTF8.
+        // See http://unicode.org/faq/utf_bom.html#utf16-3
+        var c = str.charCodeAt(i); // possibly a lead surrogate
+        if (c <= 0x7F) {
+          len++;
+        } else if (c <= 0x7FF) {
+          len += 2;
+        } else if (c >= 0xD800 && c <= 0xDFFF) {
+          len += 4; ++i;
+        } else {
+          len += 3;
+        }
+      }
+      return len;
+    };
   
+  var stringToUTF8Array = (str, heap, outIdx, maxBytesToWrite) => {
+      assert(typeof str === 'string');
+      // Parameter maxBytesToWrite is not optional. Negative values, 0, null,
+      // undefined and false each don't write out any bytes.
+      if (!(maxBytesToWrite > 0))
+        return 0;
+  
+      var startIdx = outIdx;
+      var endIdx = outIdx + maxBytesToWrite - 1; // -1 for string null terminator.
+      for (var i = 0; i < str.length; ++i) {
+        // Gotcha: charCodeAt returns a 16-bit word that is a UTF-16 encoded code
+        // unit, not a Unicode code point of the character! So decode
+        // UTF16->UTF32->UTF8.
+        // See http://unicode.org/faq/utf_bom.html#utf16-3
+        // For UTF8 byte structure, see http://en.wikipedia.org/wiki/UTF-8#Description
+        // and https://www.ietf.org/rfc/rfc2279.txt
+        // and https://tools.ietf.org/html/rfc3629
+        var u = str.charCodeAt(i); // possibly a lead surrogate
+        if (u >= 0xD800 && u <= 0xDFFF) {
+          var u1 = str.charCodeAt(++i);
+          u = 0x10000 + ((u & 0x3FF) << 10) | (u1 & 0x3FF);
+        }
+        if (u <= 0x7F) {
+          if (outIdx >= endIdx) break;
+          heap[outIdx++] = u;
+        } else if (u <= 0x7FF) {
+          if (outIdx + 1 >= endIdx) break;
+          heap[outIdx++] = 0xC0 | (u >> 6);
+          heap[outIdx++] = 0x80 | (u & 63);
+        } else if (u <= 0xFFFF) {
+          if (outIdx + 2 >= endIdx) break;
+          heap[outIdx++] = 0xE0 | (u >> 12);
+          heap[outIdx++] = 0x80 | ((u >> 6) & 63);
+          heap[outIdx++] = 0x80 | (u & 63);
+        } else {
+          if (outIdx + 3 >= endIdx) break;
+          if (u > 0x10FFFF) warnOnce('Invalid Unicode code point ' + ptrToString(u) + ' encountered when serializing a JS string to a UTF-8 string in wasm memory! (Valid unicode code points should be in range 0-0x10FFFF).');
+          heap[outIdx++] = 0xF0 | (u >> 18);
+          heap[outIdx++] = 0x80 | ((u >> 12) & 63);
+          heap[outIdx++] = 0x80 | ((u >> 6) & 63);
+          heap[outIdx++] = 0x80 | (u & 63);
+        }
+      }
+      // Null-terminate the pointer to the buffer.
+      heap[outIdx] = 0;
+      return outIdx - startIdx;
+    };
+  var stringToUTF8 = (str, outPtr, maxBytesToWrite) => {
+      assert(typeof maxBytesToWrite == 'number', 'stringToUTF8(str, outPtr, maxBytesToWrite) is missing the third parameter that specifies the length of the output buffer!');
+      return stringToUTF8Array(str, HEAPU8, outPtr, maxBytesToWrite);
+    };
   var stringToUTF8OnStack = (str) => {
       var size = lengthBytesUTF8(str) + 1;
       var ret = stackAlloc(size);
@@ -1445,41 +1556,44 @@ function CbTest22_(x) { let x_ = UTF8ToString(x); let x__ = CallbackTestStr(x_);
       ret = onDone(ret);
       return ret;
     };
+
+  if (ENVIRONMENT_IS_WASM_WORKER) {
+    _wasmWorkers[0] = this;
+    addEventListener("message", _wasmWorkerAppendToQueue);
+  };
 function checkIncomingModuleAPI() {
   ignoredModuleProp('fetchSettings');
 }
 var wasmImports = {
   /** @export */
-  CbTest12: CbTest12,
+  __assert_fail: ___assert_fail,
   /** @export */
-  CbTest22_: CbTest22_,
+  _emscripten_create_wasm_worker: __emscripten_create_wasm_worker,
   /** @export */
   abort: _abort,
   /** @export */
-  emscripten_memcpy_js: _emscripten_memcpy_js,
+  emscripten_get_now: _emscripten_get_now,
   /** @export */
   emscripten_resize_heap: _emscripten_resize_heap,
   /** @export */
   emscripten_run_script: _emscripten_run_script,
   /** @export */
-  emscripten_run_script_int: _emscripten_run_script_int,
-  /** @export */
-  emscripten_run_script_string: _emscripten_run_script_string,
+  emscripten_wasm_worker_post_function_v: _emscripten_wasm_worker_post_function_v,
   /** @export */
   fd_close: _fd_close,
   /** @export */
   fd_seek: _fd_seek,
   /** @export */
-  fd_write: _fd_write
+  fd_write: _fd_write,
+  /** @export */
+  memory: wasmMemory
 };
 var wasmExports = createWasm();
 var ___wasm_call_ctors = createExportWrapper('__wasm_call_ctors');
-var __Z8StrTest1v = Module['__Z8StrTest1v'] = createExportWrapper('_Z8StrTest1v');
-var __Z8StrTest2Pc = Module['__Z8StrTest2Pc'] = createExportWrapper('_Z8StrTest2Pc');
-var __Z10myFunctioniPPc = Module['__Z10myFunctioniPPc'] = createExportWrapper('_Z10myFunctioniPPc');
-var __Z3fibi = Module['__Z3fibi'] = createExportWrapper('_Z3fibi');
-var __Z12CallbackTesti = Module['__Z12CallbackTesti'] = createExportWrapper('_Z12CallbackTesti');
-var _malloc = createExportWrapper('malloc');
+var __Z7ThrTestv = Module['__Z7ThrTestv'] = createExportWrapper('_Z7ThrTestv');
+var __Z8ThrStartv = Module['__Z8ThrStartv'] = createExportWrapper('_Z8ThrStartv');
+var __Z7ThrStopv = Module['__Z7ThrStopv'] = createExportWrapper('_Z7ThrStopv');
+var __Z9ThrStatusv = Module['__Z9ThrStatusv'] = createExportWrapper('_Z9ThrStatusv');
 var _main = Module['_main'] = createExportWrapper('main');
 var ___errno_location = createExportWrapper('__errno_location');
 var _fflush = Module['_fflush'] = createExportWrapper('fflush');
@@ -1487,13 +1601,13 @@ var _emscripten_stack_init = () => (_emscripten_stack_init = wasmExports['emscri
 var _emscripten_stack_get_free = () => (_emscripten_stack_get_free = wasmExports['emscripten_stack_get_free'])();
 var _emscripten_stack_get_base = () => (_emscripten_stack_get_base = wasmExports['emscripten_stack_get_base'])();
 var _emscripten_stack_get_end = () => (_emscripten_stack_get_end = wasmExports['emscripten_stack_get_end'])();
+var _emscripten_wasm_worker_initialize = Module['_emscripten_wasm_worker_initialize'] = createExportWrapper('emscripten_wasm_worker_initialize');
 var stackSave = createExportWrapper('stackSave');
 var stackRestore = createExportWrapper('stackRestore');
 var stackAlloc = createExportWrapper('stackAlloc');
 var _emscripten_stack_get_current = () => (_emscripten_stack_get_current = wasmExports['emscripten_stack_get_current'])();
 var dynCall_jiji = Module['dynCall_jiji'] = createExportWrapper('dynCall_jiji');
-var ___start_em_js = Module['___start_em_js'] = 66812;
-var ___stop_em_js = Module['___stop_em_js'] = 67038;
+
 
 // include: postamble.js
 // === Auto-generated postamble setup entry stuff ===
@@ -1678,6 +1792,9 @@ var missingLibrarySymbols = [
   'allocate',
   'writeStringToMemory',
   'writeAsciiToMemory',
+  '_wasmWorkerPostFunction1',
+  '_wasmWorkerPostFunction2',
+  '_wasmWorkerPostFunction3',
 ];
 missingLibrarySymbols.forEach(missingLibrarySymbol)
 
@@ -1782,6 +1899,15 @@ var unexportedSymbols = [
   'SDL_gfx',
   'allocateUTF8',
   'allocateUTF8OnStack',
+  '_wasmWorkers',
+  '_wasmWorkersID',
+  '_wasmWorkerDelayedMessageQueue',
+  '_wasmWorkerAppendToQueue',
+  '_wasmWorkerRunPostMessage',
+  '_wasmWorkerInitializeRuntime',
+  'atomicWaitStates',
+  'liveAtomicWaitAsyncs',
+  'liveAtomicWaitAsyncCounter',
 ];
 unexportedSymbols.forEach(unexportedRuntimeSymbol);
 
@@ -1833,6 +1959,10 @@ function run() {
   }
 
     stackCheckInit();
+
+  if (ENVIRONMENT_IS_WASM_WORKER) {
+    return initRuntime();
+  }
 
   preRun();
 
