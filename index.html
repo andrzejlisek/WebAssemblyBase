@@ -92,6 +92,10 @@ if(typeof window === 'undefined') {
     </script>
   </head>
   <body>
+    <a href="hello.cpp">hello.cpp</a><br>
+    <a href="hello.js">hello.js</a><br>
+    <a href="hello.ww.js">hello.ww.js</a><br>
+    <a href="hello.wasm">hello.wasm</a><br>
     <pre>emcc hello.cpp -o hello.js -s NO_EXIT_RUNTIME=1 -s "EXPORTED_RUNTIME_METHODS=['ccall']" -sWASM_WORKERS</pre>
     <div id="textcontent"></div>
     <input type="button" value="Test" onclick="BtnTest()">
