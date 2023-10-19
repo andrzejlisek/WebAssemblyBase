@@ -1,12 +1,12 @@
 # WebAssemblyBase
 
-This repository is for the testing WebAssembly. I want to achieve the following goals:
-1. Pass number from JavaScript to C++ - **DONE**
-2. Pass number from C++ to JavaScript - **DONE**
-3. Pass string from JavaScript to C++ - **DONE**
-4. Pass string from C++ to JavaScript - **DONE**
-5. Invoke Javascript callback - **DONE**
-6. Use thread for run looping function - **Problems**
+This repository is for the testing WebAssembly and has the following demos:
+1. Pass number from JavaScript to C++
+2. Pass number from C++ to JavaScript
+3. Pass string from JavaScript to C++
+4. Pass string from C++ to JavaScript
+5. Invoke Javascript callback
+6. Use thread for run looping function
 
 There are four pages:
 1. General - test some interaction wothout threads.

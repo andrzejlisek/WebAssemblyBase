@@ -50,8 +50,7 @@ bool ThrWork;
 
 void ThrTestProc()
 {
-    Info("Thread test procedure start");
-    Info("Thread test procedure stop");
+    ThrCounter++;
 }
 
 void * ThrTestProc0(void *arg)
@@ -63,14 +62,12 @@ void * ThrTestProc0(void *arg)
 
 void ThrProc()
 {
-    Info("Thread function start");
     ThrCounter = 0;
     ThrWork = true;
     while (ThrWork)
     {
         ThrCounter++;
     }
-    Info("Thread function stop");
 }
 
 void * ThrProc0(void *arg)
